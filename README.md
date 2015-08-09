@@ -5,10 +5,6 @@ Sushi is a tiny, simple hypervisor written to demonstrate an ability to analyze
 kernel mode code from the Ring-1. As an example, it detects a certain pattern of
 PatchGuard activities and stops them when it is observed.
 
-A related blog entry can be found here:
-
-    http://standa-note.blogspot.ca/2015/03/section-based-code-injection-and-its.html
-
 
 Installation and Uninstallation
 --------------------------------
@@ -39,7 +35,8 @@ install the driver. See the blog entry for configuration of the virtual machine
 if you are going to test with VMware.
 
 Once you have installed the Sushi.sys, it logs interesting activities on 
-C:\Windows\Sushi.log and DebugView when it occurred. 
+C:\Windows\Sushi.log and DebugView when it occurred. Also, you can run 
+SushiTest.exe and see its output is being changed.
 ![Basic Output](/img/basic_output.png)
 
 Also, you can install ChangeMSR.sys in the same way as above to trigger more 
