@@ -35,7 +35,7 @@ install the driver. See the blog entry for configuration of the virtual machine
 if you are going to test with VMware.
 
 Once you have installed the Sushi.sys, it logs interesting activities on 
-C:\Windows\Sushi.log and DebugView when it occurred. Also, you can run 
+C:\Windows\Sushi.log and DebugView when it occurred, or you can run 
 SushiTest.exe and see its output is being changed.
 ![Basic Output](/img/basic_output.png)
 
