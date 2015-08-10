@@ -3,7 +3,8 @@
 // found in the LICENSE file.
 
 //
-// This module defines constants and structures defined by the x86-64 archtecture
+// This module defines constants and structures defined by the x86-64
+// archtecture
 //
 #pragma once
 

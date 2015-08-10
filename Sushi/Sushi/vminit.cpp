@@ -7,11 +7,11 @@
 //
 #include "stdafx.h"
 #include "vminit.h"
+#include "log.h"
 #include "misc.h"
+#include "asm.h"
 #include "ia32_type.h"
 #include "vmx_type.h"
-#include "log.h"
-#include "asm.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -62,8 +62,8 @@ EXTERN_C static ULONG_PTR VminitpGetSegmentBaseByDescriptor(
 EXTERN_C static ULONG_PTR VminitpGetSegmentBase(_In_ ULONG_PTR GdtBase,
                                                 _In_ USHORT SegmentSelector);
 
-EXTERN_C static ULONG VminitpAdjustByRdmsr(_In_ ULONG MsrNumber,
-                                           _In_ ULONG RequestedValue);
+EXTERN_C static ULONG VminitpAdjustControlValue(_In_ ULONG MsrNumber,
+                                                _In_ ULONG RequestedValue);
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -75,12 +75,13 @@ EXTERN_C static ULONG VminitpAdjustByRdmsr(_In_ ULONG MsrNumber,
 // implementations
 //
 
+// Virtualize the current processor
 ALLOC_TEXT(INIT, VminitStartVM)
 _Use_decl_annotations_ EXTERN_C NTSTATUS VminitStartVM(void *Context) {
   UNREFERENCED_PARAMETER(Context);
 
   LOG_INFO("Initializing VMX for the processor %d.",
-            KeGetCurrentProcessorNumber());
+           KeGetCurrentProcessorNumber());
 
   if (!VminitpIsVmxAvailable()) {
     return STATUS_UNSUCCESSFUL;
@@ -93,6 +94,7 @@ _Use_decl_annotations_ EXTERN_C NTSTATUS VminitStartVM(void *Context) {
   return STATUS_SUCCESS;
 }
 
+// Checks if the system supports virtualization
 ALLOC_TEXT(INIT, VminitpIsVmxAvailable)
 _Use_decl_annotations_ EXTERN_C static bool VminitpIsVmxAvailable() {
   // DISCOVERING SUPPORT FOR VMX
@@ -108,8 +110,7 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpIsVmxAvailable() {
   // BASIC VMX INFORMATION
   // The first processors to support VMX operation use the write-back type.
   IA32_VMX_BASIC_MSR vmxBasicMsr = {__readmsr(IA32_VMX_BASIC)};
-  if (vmxBasicMsr.Fields.MemoryType != 6)  // Write Back (WB)
-  {
+  if (vmxBasicMsr.Fields.MemoryType != 6) {  // Write Back (WB)
     LOG_ERROR("Write-back cache type is not supported.");
     return false;
   }
@@ -125,9 +126,12 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpIsVmxAvailable() {
   return true;
 }
 
+// Allocates structures for virtualization, initializes VMCS and virtualizes
+// the current processor
 ALLOC_TEXT(INIT, VminitpInitializeVM)
 _Use_decl_annotations_ EXTERN_C static void VminitpInitializeVM(
     ULONG_PTR GuestStackPointer, ULONG_PTR GuestInstructionPointer) {
+  // Allocate related structures
   auto ProcessorData =
       reinterpret_cast<PER_PROCESSOR_DATA *>(ExAllocatePoolWithTag(
           NonPagedPoolNx, sizeof(PER_PROCESSOR_DATA), SUSHI_POOL_TAG_NAME));
@@ -146,6 +150,8 @@ _Use_decl_annotations_ EXTERN_C static void VminitpInitializeVM(
   RtlZeroMemory(VmcsRegion, MAXIMUM_VMCS_SIZE);
   RtlZeroMemory(VmxonRegion, MAXIMUM_VMCS_SIZE);
   RtlZeroMemory(msrBitmap, PAGE_SIZE);
+
+  // Initialize stack memory for VMM like this:
   /*
   (High)
   +------------------+
@@ -171,10 +177,14 @@ _Use_decl_annotations_ EXTERN_C static void VminitpInitializeVM(
   LOG_DEBUG("GuestStackPointer= %p", GuestStackPointer);
   *reinterpret_cast<ULONG_PTR *>(VmmStackBase) = 0xffffffffffffffff;
   *reinterpret_cast<PER_PROCESSOR_DATA **>(VmmStackData) = ProcessorData;
+
+  // Initialize the management structure
   ProcessorData->VmmStackTop = VmmStackTop;
   ProcessorData->VmcsRegion = VmcsRegion;
   ProcessorData->VmxonRegion = VmxonRegion;
   ProcessorData->MsrBitmap = msrBitmap;
+
+  // Set up VMCS
   if (!VminitpEnterVmxMode(ProcessorData)) {
     goto ReturnFalse;
   }
@@ -186,7 +196,11 @@ _Use_decl_annotations_ EXTERN_C static void VminitpInitializeVM(
     goto ReturnFalseWithVmxOff;
   }
 
+  // Do virtualize the processor
   VminitpLaunchVM();
+
+// Here is not be executed with successful vmlaunch. Instead, the context
+// jumps to an address specified by GuestInstructionPointer.
 
 ReturnFalseWithVmxOff:;
   __vmx_off();
@@ -213,7 +227,7 @@ ReturnFalse:;
 ALLOC_TEXT(INIT, VminitpEnterVmxMode)
 _Use_decl_annotations_ EXTERN_C static bool VminitpEnterVmxMode(
     PER_PROCESSOR_DATA *ProcessorData) {
-  // apply FIXED bits
+  // Apply FIXED bits
   const CR0_REG cr0Fixed0 = {__readmsr(IA32_VMX_CR0_FIXED0)};
   const CR0_REG cr0Fixed1 = {__readmsr(IA32_VMX_CR0_FIXED1)};
   CR0_REG cr0 = {__readcr0()};
@@ -245,7 +259,7 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpEnterVmxMode(
 ALLOC_TEXT(INIT, VminitpInitializeVMCS)
 _Use_decl_annotations_ EXTERN_C static bool VminitpInitializeVMCS(
     PER_PROCESSOR_DATA *ProcessorData) {
-  // write a VMCS revision identifier
+  // Write a VMCS revision identifier
   IA32_VMX_BASIC_MSR vmxBasicMsr = {__readmsr(IA32_VMX_BASIC)};
   ProcessorData->VmcsRegion->RevisionIdentifier =
       vmxBasicMsr.Fields.RevisionIdentifier;
@@ -259,13 +273,13 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpInitializeVMCS(
   }
 
   // Software makes a VMCS current by executing VMPTRLD with the address
-  // of the VMCS; that address is loaded into the current-VMCS pointer .
+  // of the VMCS; that address is loaded into the current-VMCS pointer.
   if (__vmx_vmptrld(
           reinterpret_cast<unsigned long long *>(&vmcsRegionPA.QuadPart))) {
     return false;
   }
 
-  // the launch state of current VMCS is "clear"
+  // The launch state of current VMCS is "clear"
   return true;
 }
 
@@ -285,62 +299,65 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpSetupVMCS(
   VMX_VM_ENTER_CONTROLS vmEnterCtlRequested = {};
   vmEnterCtlRequested.Fields.IA32eModeGuest = true;
   VMX_VM_ENTER_CONTROLS vmEnterCtl = {
-      VminitpAdjustByRdmsr(IA32_VMX_ENTRY_CTLS, vmEnterCtlRequested.All)};
+      VminitpAdjustControlValue(IA32_VMX_ENTRY_CTLS, vmEnterCtlRequested.All)};
 
   VMX_VM_EXIT_CONTROLS vmExitCtlRequested = {};
   vmExitCtlRequested.Fields.AcknowledgeInterruptOnExit = true;
   vmExitCtlRequested.Fields.HostAddressSpaceSize = true;
   VMX_VM_EXIT_CONTROLS vmExitCtl = {
-      VminitpAdjustByRdmsr(IA32_VMX_EXIT_CTLS, vmExitCtlRequested.All)};
+      VminitpAdjustControlValue(IA32_VMX_EXIT_CTLS, vmExitCtlRequested.All)};
 
   VMX_PIN_BASED_CONTROLS vmPinCtlRequested = {};
   VMX_PIN_BASED_CONTROLS vmPinCtl = {
-      VminitpAdjustByRdmsr(IA32_VMX_PINBASED_CTLS, vmPinCtlRequested.All)};
+      VminitpAdjustControlValue(IA32_VMX_PINBASED_CTLS, vmPinCtlRequested.All)};
 
   VMX_CPU_BASED_CONTROLS vmCpuCtlRequested = {};
   vmCpuCtlRequested.Fields.RDTSCExiting = true;
-  vmCpuCtlRequested.Fields.CR3LoadExiting = true;
-  vmCpuCtlRequested.Fields.CR3StoreExiting = false;  // No MOV from CR3
-  vmCpuCtlRequested.Fields.CR8LoadExiting = true;
-  vmCpuCtlRequested.Fields.CR8StoreExiting = false;  // No MOV from CR8
+  vmCpuCtlRequested.Fields.CR3LoadExiting = true;  // MOV to CR3
+  vmCpuCtlRequested.Fields.CR8LoadExiting = true;  // MOV to CR8
   vmCpuCtlRequested.Fields.MovDRExiting = true;
   vmCpuCtlRequested.Fields.UseMSRBitmaps = true;
   vmCpuCtlRequested.Fields.ActivateSecondaryControl = true;
-  VMX_CPU_BASED_CONTROLS vmCpuCtl = {
-      VminitpAdjustByRdmsr(IA32_VMX_PROCBASED_CTLS, vmCpuCtlRequested.All)};
+  VMX_CPU_BASED_CONTROLS vmCpuCtl = {VminitpAdjustControlValue(
+      IA32_VMX_PROCBASED_CTLS, vmCpuCtlRequested.All)};
 
   VMX_SECONDARY_CPU_BASED_CONTROLS vmCpuCtl2Requested = {};
   vmCpuCtl2Requested.Fields.EnableRDTSCP = true;
   vmCpuCtl2Requested.Fields.DescriptorTableExiting = true;
-  VMX_CPU_BASED_CONTROLS vmCpuCtl2 = {
-      VminitpAdjustByRdmsr(IA32_VMX_PROCBASED_CTLS2, vmCpuCtl2Requested.All)};
+  VMX_CPU_BASED_CONTROLS vmCpuCtl2 = {VminitpAdjustControlValue(
+      IA32_VMX_PROCBASED_CTLS2, vmCpuCtl2Requested.All)};
 
-  // Activate all RDMSR VM exits except for ones against below MSRs
+  // Set up the MSR bitmap
+
+  // Activate VM-exit for RDMSR against all MSRs
   const auto bitMapReadLow =
       reinterpret_cast<UCHAR *>(ProcessorData->MsrBitmap);
   const auto bitMapReadHigh = bitMapReadLow + 1024;
   RtlFillMemory(bitMapReadLow, 1024, 0xff);   // read        0 -     1fff
   RtlFillMemory(bitMapReadHigh, 1024, 0xff);  // read c0000000 - c0001fff
 
-  // Ignore IA32_MPERF (000000e7) and IA32_APERF (000000e8)
+  // But ignore IA32_MPERF (000000e7) and IA32_APERF (000000e8)
   RTL_BITMAP bitMapReadLowHeader = {};
   RtlInitializeBitMap(&bitMapReadLowHeader,
                       reinterpret_cast<PULONG>(bitMapReadLow), 1024 * 8);
   RtlClearBits(&bitMapReadLowHeader, 0xe7, 2);
 
-  // Ignore IA32_GS_BASE (c0000101) and IA32_KERNEL_GS_BASE (c0000102)
+  // But ignore IA32_GS_BASE (c0000101) and IA32_KERNEL_GS_BASE (c0000102)
   RTL_BITMAP bitMapReadHighHeader = {};
   RtlInitializeBitMap(&bitMapReadHighHeader,
                       reinterpret_cast<PULONG>(bitMapReadHigh), 1024 * 8);
   RtlClearBits(&bitMapReadHighHeader, 0x101, 2);
 
-  //// Activate all WRMSR VM exits
-  // const auto bitMapWriteLow = bitMapReadHigh + 1024;
-  // const auto bitMapWriteHigh = bitMapWriteLow + 1024;
-  // RtlFillMemory(bitMapWriteLow, 1024, 0xff);   // write        0 -     1fff
-  // RtlFillMemory(bitMapWriteHigh, 1024, 0xff);  // write c0000000 - c0001fff
-
   const auto msrBitmapPA = MmGetPhysicalAddress(ProcessorData->MsrBitmap);
+
+  // Set up CR0 and CR4 bitmaps
+
+  // Where a bit is     masked, the shadow bit appears
+  // Where a bit is not masked, the actual bit appears
+  CR0_REG cr0mask = {};
+  cr0mask.Fields.WP = true;
+  CR4_REG cr4mask = {};
+  cr4mask.Fields.PGE = true;
 
   // clang-format off
   /* 16-Bit Control Field */
@@ -356,8 +373,8 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpSetupVMCS(
   error |= __vmx_vmwrite(GUEST_TR_SELECTOR, AsmReadTR());
 
   /* 16-Bit Host-State Fields */
-  error |= __vmx_vmwrite(HOST_ES_SELECTOR, AsmReadES() & 0xf8);
-  error |= __vmx_vmwrite(HOST_CS_SELECTOR, AsmReadCS() & 0xf8);
+  error |= __vmx_vmwrite(HOST_ES_SELECTOR, AsmReadES() & 0xf8); // RPL and TI 
+  error |= __vmx_vmwrite(HOST_CS_SELECTOR, AsmReadCS() & 0xf8); // have to be 0
   error |= __vmx_vmwrite(HOST_SS_SELECTOR, AsmReadSS() & 0xf8);
   error |= __vmx_vmwrite(HOST_DS_SELECTOR, AsmReadDS() & 0xf8);
   error |= __vmx_vmwrite(HOST_FS_SELECTOR, AsmReadFS() & 0xf8);
@@ -365,7 +382,6 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpSetupVMCS(
   error |= __vmx_vmwrite(HOST_TR_SELECTOR, AsmReadTR() & 0xf8);
 
   /* 64-Bit Control Fields */
-
   error |= __vmx_vmwrite(IO_BITMAP_A, 0);
   error |= __vmx_vmwrite(IO_BITMAP_B, 0);
   error |= __vmx_vmwrite(MSR_BITMAP, msrBitmapPA.QuadPart);
@@ -417,12 +433,6 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpSetupVMCS(
   error |= __vmx_vmwrite(HOST_IA32_SYSENTER_CS, __readmsr(IA32_SYSENTER_CS));
 
   /* Natural-Width Control Fields */
-  // Where a bit is     masked, the shadow bit appears
-  // Where a bit is not masked, the actual bit appears
-  CR0_REG cr0mask = {};
-  cr0mask.Fields.WP = true;
-  CR4_REG cr4mask = {};
-  cr4mask.Fields.PGE = true;
   error |= __vmx_vmwrite(CR0_GUEST_HOST_MASK, cr0mask.All);
   error |= __vmx_vmwrite(CR4_GUEST_HOST_MASK, cr4mask.All);
   error |= __vmx_vmwrite(CR0_READ_SHADOW, __readcr0());
@@ -472,6 +482,7 @@ _Use_decl_annotations_ EXTERN_C static bool VminitpSetupVMCS(
   return vmxStatus == VMX_OK;
 }
 
+// Executes vmlaunch
 ALLOC_TEXT(INIT, VminitpLaunchVM)
 _Use_decl_annotations_ EXTERN_C static void VminitpLaunchVM() {
   size_t errorCode = 0;
@@ -482,6 +493,9 @@ _Use_decl_annotations_ EXTERN_C static void VminitpLaunchVM() {
   }
   DBG_BREAK();
   vmxStatus = static_cast<VMX_STATUS>(__vmx_vmlaunch());
+
+  // Here is not be executed with successful vmlaunch. Instead, the context
+  // jumps to an address specified by GUEST_RIP.
   if (vmxStatus == VMX_ERROR_WITH_STATUS) {
     vmxStatus =
         static_cast<VMX_STATUS>(__vmx_vmread(VM_INSTRUCTION_ERROR, &errorCode));
@@ -490,6 +504,7 @@ _Use_decl_annotations_ EXTERN_C static void VminitpLaunchVM() {
   DBG_BREAK();
 }
 
+// Returns access right of the segment specified by the SegmentSelector for VMX
 ALLOC_TEXT(INIT, VminitpGetSegmentAccessRight)
 _Use_decl_annotations_ EXTERN_C static ULONG VminitpGetSegmentAccessRight(
     USHORT SegmentSelector) {
@@ -508,6 +523,7 @@ _Use_decl_annotations_ EXTERN_C static ULONG VminitpGetSegmentAccessRight(
   return accessRight.All;
 }
 
+// Returns a base address of the segment specified by SegmentSelector
 ALLOC_TEXT(INIT, VminitpGetSegmentBase)
 _Use_decl_annotations_ EXTERN_C static ULONG_PTR VminitpGetSegmentBase(
     ULONG_PTR GdtBase, USHORT SegmentSelector) {
@@ -531,6 +547,7 @@ _Use_decl_annotations_ EXTERN_C static ULONG_PTR VminitpGetSegmentBase(
   }
 }
 
+// Returns the segment descriptor corresponds to the SegmentSelector
 ALLOC_TEXT(INIT, VminitpGetSegmentDescriptor)
 _Use_decl_annotations_ EXTERN_C static SEG_DESCRIPTOR *
 VminitpGetSegmentDescriptor(ULONG_PTR DescriptorTableBase,
@@ -540,6 +557,7 @@ VminitpGetSegmentDescriptor(ULONG_PTR DescriptorTableBase,
       DescriptorTableBase + ss.Fields.Index * sizeof(SEG_DESCRIPTOR));
 }
 
+// Returns a base address of SegmentDescriptor
 ALLOC_TEXT(INIT, VminitpGetSegmentBaseByDescriptor)
 _Use_decl_annotations_ EXTERN_C static ULONG_PTR
 VminitpGetSegmentBaseByDescriptor(const SEG_DESCRIPTOR *SegmentDescriptor) {
@@ -557,8 +575,9 @@ VminitpGetSegmentBaseByDescriptor(const SEG_DESCRIPTOR *SegmentDescriptor) {
   return base;
 }
 
-ALLOC_TEXT(INIT, VminitpAdjustByRdmsr)
-_Use_decl_annotations_ EXTERN_C static ULONG VminitpAdjustByRdmsr(
+// Adjust the requested control value with consulting a value of related MSR
+ALLOC_TEXT(INIT, VminitpAdjustControlValue)
+_Use_decl_annotations_ EXTERN_C static ULONG VminitpAdjustControlValue(
     ULONG MsrNumber, ULONG RequestedValue) {
   LARGE_INTEGER msrValue = {};
   msrValue.QuadPart = __readmsr(MsrNumber);

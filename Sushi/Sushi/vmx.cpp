@@ -7,11 +7,11 @@
 //
 #include "stdafx.h"
 #include "vmx.h"
-#include "ia32_type.h"
-#include "vmx_type.h"
 #include "log.h"
 #include "asm.h"
 #include "misc.h"
+#include "ia32_type.h"
+#include "vmx_type.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -28,6 +28,7 @@
 // types
 //
 
+// Represents raw structure of stack of VMM when VmxVmExitHandler() is called
 struct VMM_STACK {
   ULONG_PTR r15;
   ULONG_PTR r14;
@@ -46,9 +47,10 @@ struct VMM_STACK {
   ULONG_PTR rcx;
   ULONG_PTR rax;
   ULONG_PTR Reserved;
-  struct PER_PROCESSOR_DATA *ProcessorData;
+  PER_PROCESSOR_DATA *ProcessorData;
 };
 
+// Things need to be read and written by each VM-exit handler
 struct GUEST_CONTEXT {
   union {
     VMM_STACK *Stack;
@@ -125,16 +127,27 @@ EXTERN_C static void VmxpAdjustGuestInstructionPointer(_In_ ULONG_PTR GuestRip);
 // implementations
 //
 
+// A high level VMX handler called from AsmVmExitHandler().
+// Return true for vmresume, or return false for vmxoff.
 _Use_decl_annotations_ EXTERN_C bool VmxVmExitHandler(VMM_STACK *Stack) {
-  GUEST_CONTEXT guestContext = {Stack, VmxpVmRead(GUEST_RFLAGS),
-                                VmxpVmRead(GUEST_RIP),
-                                __readcr8(), KeGetCurrentIrql(), true};
-  if (guestContext.Irql < DISPATCH_LEVEL) {
+  // Raise IRQL as quick as possible
+  const auto guestIrql = KeGetCurrentIrql();
+  const auto guestCr8 = __readcr8();
+  if (guestIrql < DISPATCH_LEVEL) {
     KeRaiseIrqlToDpcLevel();
   }
   NT_ASSERT(Stack->Reserved == 0xffffffffffffffff);
 
+  // Capture the current guest state
+  GUEST_CONTEXT guestContext = {Stack,
+                                VmxpVmRead(GUEST_RFLAGS),
+                                VmxpVmRead(GUEST_RIP),
+                                guestCr8,
+                                guestIrql,
+                                true};
   guestContext.GpRegs->rsp = VmxpVmRead(GUEST_RSP);
+
+  // Dispatch the current VM-exit event
   const VM_EXIT_INFORMATION exitReason = {
       static_cast<ULONG32>(VmxpVmRead(VM_EXIT_REASON))};
 
@@ -195,10 +208,13 @@ _Use_decl_annotations_ EXTERN_C bool VmxVmExitHandler(VMM_STACK *Stack) {
   if (guestContext.Irql < DISPATCH_LEVEL) {
     KeLowerIrql(guestContext.Irql);
   }
+
+  // Apply (possibly) updated CR8 by the handler
   __writecr8(guestContext.Cr8);
   return guestContext.VmContinue;
 }
 
+// CPUID
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleCpuid(
     GUEST_CONTEXT *GuestContext) {
   unsigned int cpuInfo[4] = {};
@@ -206,7 +222,8 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleCpuid(
   const auto subFunctionId = static_cast<int>(GuestContext->GpRegs->rcx);
 
   if (functionId == 0 && subFunctionId == SUSHI_BACKDOOR_CODE) {
-    GuestContext->GpRegs->rbx = 'ol I';  // I love sushi
+    // Say "I love sushi" when the back-door code was given
+    GuestContext->GpRegs->rbx = 'ol I';
     GuestContext->GpRegs->rdx = 's ev';
     GuestContext->GpRegs->rcx = 'ihsu';
   } else {
@@ -220,6 +237,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleCpuid(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// RDTSC
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleRdtsc(
     GUEST_CONTEXT *GuestContext) {
   ULARGE_INTEGER tsc = {};
@@ -228,6 +246,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleRdtsc(
   GuestContext->GpRegs->rax =
       tsc.LowPart & 0xffffff00;  // Drop lowest 8 bits for demo
 
+  // Return 0 when the guest is in an interesting address
   if (MiscIsInterestingAddress(GuestContext->Rip)) {
     LOG_DEBUG_SAFE("GuestRip= %p, Rdtsc  => %p", GuestContext->Rip,
                    tsc.QuadPart);
@@ -236,6 +255,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleRdtsc(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// RDTSCP
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleRdtscp(
     GUEST_CONTEXT *GuestContext) {
   unsigned int tscAux = 0;
@@ -249,6 +269,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleRdtscp(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// XSETBV. It is executed at the time of system resuming
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleXsetbv(
     GUEST_CONTEXT *GuestContext) {
   AsmXsetbv(static_cast<ULONG>(GuestContext->GpRegs->rcx),
@@ -258,14 +279,19 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleXsetbv(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// RDMSR
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleMsrReadAccess(
     GUEST_CONTEXT *GuestContext) {
   VmxpHandleMsrAccess(GuestContext, true);
 }
+
+// WRMSR
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleMsrWriteAccess(
     GUEST_CONTEXT *GuestContext) {
   VmxpHandleMsrAccess(GuestContext, false);
 }
+
+// RDMSR and WRMSR
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleMsrAccess(
     GUEST_CONTEXT *GuestContext, bool ReadAccess) {
   size_t vmcsField = 0;
@@ -289,9 +315,9 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleMsrAccess(
       break;
   }
 
-  // This unconditional __readmsr and __writemsr can cause #GP resulting in a
-  // bug check. A proper way to solve this is check supported MSR values
-  // beforehand and inject an exception when unsupported MSR values are given.
+  // This unconditional __readmsr and __writemsr can cause #GP resulting in bug
+  // check. A proper way to solve this is check supported MSR values beforehand
+  // and inject an exception when unsupported MSR values are given.
   LARGE_INTEGER msrValue = {};
   if (ReadAccess) {
     if (vmcsField) {
@@ -300,13 +326,14 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleMsrAccess(
       msrValue.QuadPart =
           __readmsr(static_cast<ULONG>(GuestContext->GpRegs->rcx));
     }
-
-    if (MiscIsInterestingAddress(GuestContext->Rip)) {
-      LOG_INFO_SAFE("GuestRip= %p, RDMSR(%p)", GuestContext->Rip,
-                     GuestContext->GpRegs->rcx);
-    }
     GuestContext->GpRegs->rax = msrValue.LowPart;
     GuestContext->GpRegs->rdx = msrValue.HighPart;
+
+    // Log when the guest is in an interesting address
+    if (MiscIsInterestingAddress(GuestContext->Rip)) {
+      LOG_INFO_SAFE("GuestRip= %p, RDMSR(%p)", GuestContext->Rip,
+                    GuestContext->GpRegs->rcx);
+    }
   } else {
     msrValue.LowPart = static_cast<ULONG>(GuestContext->GpRegs->rax);
     msrValue.HighPart = static_cast<ULONG>(GuestContext->GpRegs->rdx);
@@ -321,15 +348,17 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleMsrAccess(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// LIDT, SIDT, LGDT and SGDT
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleGdtrOrIdtrAccess(
     GUEST_CONTEXT *GuestContext) {
   const GDTR_OR_IDTR_ACCESS_QUALIFICATION exitQualification = {
       static_cast<ULONG32>(VmxpVmRead(VMX_INSTRUCTION_INFO))};
 
-  const auto displacement = VmxpVmRead(EXIT_QUALIFICATION);
-
   NT_ASSERT(exitQualification.Fields.AddressSize != BIT_16);
   NT_ASSERT(exitQualification.Fields.OperandSize == BIT_32);
+
+  // Calculate an address to be used for the instruction
+  const auto displacement = VmxpVmRead(EXIT_QUALIFICATION);
 
   // Base
   ULONG_PTR baseValue = 0;
@@ -356,12 +385,12 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleGdtrOrIdtrAccess(
     }
   }
 
-  ULONG_PTR operationAddress = baseValue + indexValue + displacement;
+  auto operationAddress = baseValue + indexValue + displacement;
   if (exitQualification.Fields.AddressSize == BIT_32) {
     operationAddress &= 0xffffffff;
   }
-  auto descriptorTable = reinterpret_cast<IDTR *>(operationAddress);
 
+  // Log when the guest is in an interesting address
   if (MiscIsInterestingAddress(GuestContext->Rip)) {
     LOG_INFO_SAFE(
         "GuestRip= %p, %s%sDT(%p)", GuestContext->Rip,
@@ -370,39 +399,44 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleGdtrOrIdtrAccess(
         operationAddress);
   }
 
+  // Emulate the instruction
+  auto descriptorTableReg = reinterpret_cast<IDTR *>(operationAddress);
   switch (exitQualification.Fields.InstructionIdentity) {
     case SGDT:
-      descriptorTable->Address = VmxpVmRead(GUEST_GDTR_BASE);
-      descriptorTable->Limit =
+      descriptorTableReg->Address = VmxpVmRead(GUEST_GDTR_BASE);
+      descriptorTableReg->Limit =
           static_cast<unsigned short>(VmxpVmRead(GUEST_GDTR_LIMIT));
       break;
     case SIDT:
-      descriptorTable->Address = VmxpVmRead(GUEST_IDTR_BASE);
-      descriptorTable->Limit =
+      descriptorTableReg->Address = VmxpVmRead(GUEST_IDTR_BASE);
+      descriptorTableReg->Limit =
           static_cast<unsigned short>(VmxpVmRead(GUEST_IDTR_LIMIT));
       break;
     case LGDT:
-      VmxpVmWrite(GUEST_GDTR_BASE, descriptorTable->Address);
-      VmxpVmWrite(GUEST_GDTR_LIMIT, descriptorTable->Limit);
+      VmxpVmWrite(GUEST_GDTR_BASE, descriptorTableReg->Address);
+      VmxpVmWrite(GUEST_GDTR_LIMIT, descriptorTableReg->Limit);
       break;
     case LIDT:
-      VmxpVmWrite(GUEST_IDTR_BASE, descriptorTable->Address);
-      VmxpVmWrite(GUEST_IDTR_LIMIT, descriptorTable->Limit);
+      VmxpVmWrite(GUEST_IDTR_BASE, descriptorTableReg->Address);
+      VmxpVmWrite(GUEST_IDTR_LIMIT, descriptorTableReg->Limit);
       break;
   }
 
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// LLDT, LTR, SLDT, and STR
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleLdtrOrTrAccess(
     GUEST_CONTEXT *GuestContext) {
   const LDTR_OR_TR_ACCESS_QUALIFICATION exitQualification = {
       static_cast<ULONG32>(VmxpVmRead(VMX_INSTRUCTION_INFO))};
 
+  // Calculate an address or a register to be used for the instruction
   const auto displacement = VmxpVmRead(EXIT_QUALIFICATION);
 
   ULONG_PTR operationAddress = 0;
   if (exitQualification.Fields.RegisterAccess) {
+    // Register
     const auto registerUsed =
         VmxpSelectRegister(exitQualification.Fields.Register1, GuestContext);
     operationAddress = reinterpret_cast<ULONG_PTR>(registerUsed);
@@ -438,8 +472,8 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleLdtrOrTrAccess(
     }
   }
 
+  // Emulate the instruction
   auto selector = reinterpret_cast<USHORT *>(operationAddress);
-
   switch (exitQualification.Fields.InstructionIdentity) {
     case SLDT:
       *selector = static_cast<USHORT>(VmxpVmRead(GUEST_LDTR_SELECTOR));
@@ -458,6 +492,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleLdtrOrTrAccess(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// MOV to / from DRx
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleDrAccess(
     GUEST_CONTEXT *GuestContext) {
   const MOV_DR_QUALIFICATION exitQualification = {
@@ -465,6 +500,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleDrAccess(
   const auto registerUsed =
       VmxpSelectRegister(exitQualification.Fields.Register, GuestContext);
 
+  // Log when the guest is in an interesting address
   if (MiscIsInterestingAddress(GuestContext->Rip)) {
     LOG_INFO_SAFE(
         "GuestRip= %p, DR=%d, AC=%s, GP=%d (%p)", GuestContext->Rip,
@@ -473,6 +509,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleDrAccess(
         exitQualification.Fields.Register, *registerUsed);
   }
 
+  // Emulate the instruction
   switch (exitQualification.Fields.Direction) {
     case MOVE_TO_DR:
       switch (exitQualification.Fields.DebuglRegister) {
@@ -513,6 +550,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleDrAccess(
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// MOV to / from CRx
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleCrAccess(
     GUEST_CONTEXT *GuestContext) {
   const MOV_CR_QUALIFICATION exitQualification = {
@@ -522,60 +560,74 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleCrAccess(
       VmxpSelectRegister(exitQualification.Fields.Register, GuestContext);
 
   bool wantToContinue = true;
-  CR0_REG cr0current = {};
-  CR0_REG cr0requested = {};
-  CR4_REG cr4current = {};
-  CR4_REG cr4requested = {};
   switch (exitQualification.Fields.AccessType) {
     case MOVE_TO_CR: {
       switch (exitQualification.Fields.ControlRegister) {
-        case 0:  // CR0 <- Reg
+        // CR0 <- Reg
+        case 0:
+          // Log when the guest is in an interesting address
           if (MiscIsInterestingAddress(GuestContext->Rip)) {
-            cr0current.All = VmxpVmRead(GUEST_CR0);
-            cr0requested.All = *registerUsed;
-            LOG_INFO_SAFE("GuestRip= %p, CR0WP Modification %p(%d) -> %p(%d)",
-                           GuestContext->Rip, cr0current.All,
-                           cr0current.Fields.WP, cr0requested.All,
-                           cr0requested.Fields.WP);
-            if (!cr0current.Fields.WP && cr0requested.Fields.WP &&
-                MiscIsInterestingContext(GuestContext->GpRegs)) {
-              wantToContinue = false;
+            const CR0_REG cr0current = {VmxpVmRead(GUEST_CR0)};
+            const CR0_REG cr0requested = {*registerUsed};
+            // And WP is being changed
+            if (cr0current.Fields.WP != cr0requested.Fields.WP) {
+              LOG_INFO_SAFE("GuestRip= %p, CR0WP Modification %p(%d) -> %p(%d)",
+                            GuestContext->Rip, cr0current.All,
+                            cr0current.Fields.WP, cr0requested.All,
+                            cr0requested.Fields.WP);
+              // Stop execution when WP is being enabled and the current context
+              // seems to be interesting as well.
+              if (!cr0current.Fields.WP && cr0requested.Fields.WP &&
+                  MiscIsInterestingContext(GuestContext->GpRegs)) {
+                wantToContinue = false;
+              }
             }
           }
           VmxpVmWrite(GUEST_CR0, *registerUsed);
           VmxpVmWrite(CR0_READ_SHADOW, *registerUsed);
           break;
 
-        case 3:  // CR3 <- Reg
+        // CR3 <- Reg
+        case 3:
+          // Log when the guest is in an interesting address
           if (MiscIsInterestingAddress(GuestContext->Rip)) {
+            // And values of current and requested CR3 are the same
             if (VmxpVmRead(GUEST_CR3) == *registerUsed) {
               LOG_INFO_SAFE("GuestRip= %p, TLB Flush with CR3 %p",
-                             GuestContext->Rip, *registerUsed);
+                            GuestContext->Rip, *registerUsed);
             }
           }
           VmxpVmWrite(GUEST_CR3, *registerUsed);
           break;
 
-        case 4:  // CR4 <- Reg
+        // CR4 <- Reg
+        case 4:
+          // Log when the guest is in an interesting address
           if (MiscIsInterestingAddress(GuestContext->Rip)) {
-            cr4current.All = VmxpVmRead(GUEST_CR4);
-            cr4requested.All = *registerUsed;
-            LOG_INFO_SAFE("GuestRip= %p, TLB Flush with CR4 %p(%d) -> %p(%d)",
-                           GuestContext->Rip, cr4current.All,
-                           cr4current.Fields.PGE, cr4requested.All,
-                           cr4requested.Fields.PGE);
+            const CR4_REG cr4current = {VmxpVmRead(GUEST_CR4)};
+            const CR4_REG cr4requested = {*registerUsed};
+            // And PGE is being changed
+            if (cr4current.Fields.PGE != cr4requested.Fields.PGE) {
+              LOG_INFO_SAFE("GuestRip= %p, TLB Flush with CR4 %p(%d) -> %p(%d)",
+                            GuestContext->Rip, cr4current.All,
+                            cr4current.Fields.PGE, cr4requested.All,
+                            cr4requested.Fields.PGE);
+            }
           }
           VmxpVmWrite(GUEST_CR4, *registerUsed);
           VmxpVmWrite(CR4_READ_SHADOW, *registerUsed);
           break;
 
-        case 8:  // CR8 <- Reg
+        // CR8 <- Reg
+        case 8:
+          // Log when the guest is in an interesting address
           if (MiscIsInterestingAddress(GuestContext->Rip)) {
+            // And CR8 is being raised to any of certain values
             if (*registerUsed > GuestContext->Cr8 &&
                 (*registerUsed == DISPATCH_LEVEL ||
                  *registerUsed == HIGH_LEVEL)) {
               LOG_INFO_SAFE("GuestRip= %p, CR8 %d -> %d", GuestContext->Rip,
-                             GuestContext->Cr8, *registerUsed);
+                            GuestContext->Cr8, *registerUsed);
             }
           }
           GuestContext->Cr8 = *registerUsed;
@@ -588,13 +640,17 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleCrAccess(
       }
     } break;
 
+    // Note that MOV from CRx should never cause VM-exit with the current
+    // settings. This is just for case when you enable it.
     case MOVE_FROM_CR: {
       switch (exitQualification.Fields.ControlRegister) {
-        case 3:  // Reg <- CR3
+        // Reg <- CR3
+        case 3:
           *registerUsed = VmxpVmRead(GUEST_CR3);
           break;
 
-        case 8:  // Reg <- CR8
+        // Reg <- CR8
+        case 8:
           *registerUsed = GuestContext->Cr8;
           break;
 
@@ -605,87 +661,116 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleCrAccess(
       }
     } break;
 
+    // Unimplemented
+    case CLTS:
+    case LMSW:
     default:
-      /* UNREACHABLE */
       DBG_BREAK();
       break;
   }
 
   if (wantToContinue) {
+    // Just continue as usual
     VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
   } else {
-    // We assume that the detected PatchGuard context is running on the 2nd
+    //
+    // Detected a PatchGuard context and want to stop its execution.
+    //
+    // Here we assume that the detected PatchGuard context is running on the 2nd
     // validation routine and not the 1st, DPC routine. Since AsmWaitForever()
     // lower IRQL forcibly, calling it from the DPC routine results in bug
     // check.
     //
-    // In this PoC project, we do not support termination from the DPC routine,
-    // and it is still safe because the DPC routine checks only very critical
-    // functions for PatchGuard itself (such as ExQueueWorkItem(),
-    // ExpWorkerThread()), and the demo does not modify any of those functions,
-    // the DPC routine will never detect corruption and modify CR0.
+    // In this PoC project, it does not support termination from the DPC
+    // routine,
+    // but it is still safe because the DPC routine checks only very critical
+    // aspects for PatchGuard itself (such as ExQueueWorkItem() and
+    // ExpWorkerThread()), and the demo does not modify any of them, thus, the
+    // DPC routine will never detect corruption and modify CR0.
     //
     // If you want to kill the context at the DPC routine, you could disassemble
-    // the return address and modify there to let the context return without
+    // the return address and modify code to let the context return without
     // doing anything devastating.
+    //
     VmxpVmWrite(GUEST_RIP, reinterpret_cast<ULONG_PTR>(AsmWaitForever));
   }
 }
 
+// VMX instructions except for VMCALL
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleVmx(
     GUEST_CONTEXT *GuestContext) {
   // CONVENTIONS
   GuestContext->Rflags.Fields.CF = true;  // Error without status
   GuestContext->Rflags.Fields.PF = false;
   GuestContext->Rflags.Fields.AF = false;
-  GuestContext->Rflags.Fields.ZF = false; // Error without status
+  GuestContext->Rflags.Fields.ZF = false;  // Error without status
   GuestContext->Rflags.Fields.SF = false;
   GuestContext->Rflags.Fields.OF = false;
   VmxpVmWrite(GUEST_RFLAGS, GuestContext->Rflags.All);
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// VMCALL
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleVmCall(
     GUEST_CONTEXT *GuestContext) {
+  // VMCALL for Sushi expects that rcx holds a command number, and rdx holds an
+  // address of a context parameter optionally
   const auto hypercallNumber = GuestContext->GpRegs->rcx;
-  const auto context = reinterpret_cast<void*>(GuestContext->GpRegs->rdx);
+  const auto context = reinterpret_cast<void *>(GuestContext->GpRegs->rdx);
 
   if (hypercallNumber == SUSHI_BACKDOOR_CODE) {
+    // Unloading requested
     DBG_BREAK();
-    const auto gdtl = VmxpVmRead(GUEST_GDTR_LIMIT);
-    const auto gdtb = VmxpVmRead(GUEST_GDTR_BASE);
-    const auto idtl = VmxpVmRead(GUEST_IDTR_LIMIT);
-    const auto idtb = VmxpVmRead(GUEST_IDTR_BASE);
-    GDTR gdtr = {static_cast<USHORT>(gdtl), gdtb};
-    IDTR idtr = {static_cast<USHORT>(idtl), idtb};
+
+    // The processor sets ffff to limits of IDT and GDT when VM-exit occurred.
+    // It is not correct value but fine to ignore since vmresume loads correct
+    // values from VMCS. But here, we are going to skip vmresume and simply
+    // return to where VMCALL is executed. It results in keeping those broken
+    // values and ends up with bug check 109, so we should fix them manually.
+    const auto gdtLimit = VmxpVmRead(GUEST_GDTR_LIMIT);
+    const auto gdtBase = VmxpVmRead(GUEST_GDTR_BASE);
+    const auto idtLimit = VmxpVmRead(GUEST_IDTR_LIMIT);
+    const auto idtBase = VmxpVmRead(GUEST_IDTR_BASE);
+    GDTR gdtr = {static_cast<USHORT>(gdtLimit), gdtBase};
+    IDTR idtr = {static_cast<USHORT>(idtLimit), idtBase};
     __lgdt(&gdtr);
     __lidt(&idtr);
 
-    const auto resultPtr = reinterpret_cast<PER_PROCESSOR_DATA**>(context);
+    // Store an address of the management structure to the context parameter
+    const auto resultPtr = reinterpret_cast<PER_PROCESSOR_DATA **>(context);
     *resultPtr = GuestContext->Stack->ProcessorData;
-    LOG_DEBUG_SAFE("context at %p %p", context, GuestContext->Stack->ProcessorData);
+    LOG_DEBUG_SAFE("context at %p %p", context,
+                   GuestContext->Stack->ProcessorData);
 
+    // Set rip to the next instruction of VMCALL
     const auto exitInstructionLength = VmxpVmRead(VM_EXIT_INSTRUCTION_LEN);
     const auto addressToReturn = GuestContext->Rip + exitInstructionLength;
 
+    // Since rflags is overwritten after VMXOFF, we should manually indicates
+    // that VMCALL was successful by clearing those flags.
     GuestContext->Rflags.Fields.CF = false;
     GuestContext->Rflags.Fields.ZF = false;
+
+    // Set registers used after VMXOFF to recover the context
     GuestContext->GpRegs->rcx = addressToReturn;
     GuestContext->GpRegs->rdx = GuestContext->GpRegs->rsp;
     GuestContext->GpRegs->r8 = GuestContext->Rflags.All;
     GuestContext->VmContinue = false;
 
   } else {
+    // Unsupported hypercall. Handle like other VMX instructions
     VmxpHandleVmx(GuestContext);
   }
 }
 
+// INVD
 _Use_decl_annotations_ EXTERN_C static void VmxpHandleInvalidateInternalCaches(
     GUEST_CONTEXT *GuestContext) {
   AsmInvalidateInternalCaches();
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
 
+// Selects a register to be used based on the Index
 _Use_decl_annotations_ EXTERN_C static ULONG_PTR *VmxpSelectRegister(
     ULONG Index, GUEST_CONTEXT *GuestContext) {
   ULONG_PTR *registerUsed = nullptr;
@@ -713,6 +798,7 @@ _Use_decl_annotations_ EXTERN_C static ULONG_PTR *VmxpSelectRegister(
   return registerUsed;
 }
 
+// Dumps guest's selectors
 _Use_decl_annotations_ EXTERN_C static void VmxpDumpGuestSelectors() {
   LOG_DEBUG_SAFE("es %04x %p %08x %08x", VmxpVmRead(GUEST_ES_SELECTOR),
                  VmxpVmRead(GUEST_ES_BASE), VmxpVmRead(GUEST_ES_LIMIT),
@@ -740,9 +826,11 @@ _Use_decl_annotations_ EXTERN_C static void VmxpDumpGuestSelectors() {
                  VmxpVmRead(GUEST_TR_AR_BYTES));
 }
 
+// A wrapper for vmx_vmread
 _Use_decl_annotations_ EXTERN_C static SIZE_T VmxpVmRead(SIZE_T Field) {
   size_t fieldValue = 0;
-  const auto vmxStatus = static_cast<VMX_STATUS>(__vmx_vmread(Field, &fieldValue));
+  const auto vmxStatus =
+      static_cast<VMX_STATUS>(__vmx_vmread(Field, &fieldValue));
   if (vmxStatus != VMX_OK) {
     LOG_ERROR_SAFE("__vmx_vmread(0x%08x) failed with an error %d", Field,
                    vmxStatus);
@@ -751,9 +839,11 @@ _Use_decl_annotations_ EXTERN_C static SIZE_T VmxpVmRead(SIZE_T Field) {
   return fieldValue;
 }
 
+// A wrapper for vmx_vmwrite
 _Use_decl_annotations_ EXTERN_C static VMX_STATUS VmxpVmWrite(
     SIZE_T Field, SIZE_T FieldValue) {
-  const auto vmxStatus = static_cast<VMX_STATUS>(__vmx_vmwrite(Field, FieldValue));
+  const auto vmxStatus =
+      static_cast<VMX_STATUS>(__vmx_vmwrite(Field, FieldValue));
   if (vmxStatus != VMX_OK) {
     LOG_ERROR_SAFE("__vmx_vmwrite(0x%08x) failed with an error %d", Field,
                    vmxStatus);
@@ -762,6 +852,7 @@ _Use_decl_annotations_ EXTERN_C static VMX_STATUS VmxpVmWrite(
   return vmxStatus;
 }
 
+// Sets rip to the next instruction
 _Use_decl_annotations_ EXTERN_C static void VmxpAdjustGuestInstructionPointer(
     ULONG_PTR GuestRip) {
   const auto exitInstructionLength = VmxpVmRead(VM_EXIT_INSTRUCTION_LEN);

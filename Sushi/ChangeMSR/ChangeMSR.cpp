@@ -79,7 +79,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
   DBG_BREAK();
 
-  status = LogInitialization(LOG_LEVEL, nullptr, DriverObject, nullptr);
+  status = LogInitialization(LOG_LEVEL, nullptr);
   if (!NT_SUCCESS(status)) {
     ExFreePoolWithTag(g_Trampoline, POOL_TAG_NAME);
   }

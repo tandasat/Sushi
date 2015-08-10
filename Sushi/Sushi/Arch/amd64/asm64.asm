@@ -27,7 +27,7 @@ VMX_ERROR_WITHOUT_STATUS    EQU     2
 ; macros
 ;
 
-; 
+; Dumps all general purpose registers and a flag register.
 ASM_DUMP_REGISTERS MACRO
     pushfq
     PUSHAQ
@@ -59,7 +59,10 @@ ENDM
 ;
 .CODE INIT
 
-; EXTERN_C bool AsmInitialieVM(void *InitializationRoutine);
+; EXTERN_C bool AsmInitialieVM(_In_ void(* VmInitializationRoutine)(
+;     ULONG_PTR GuestStackPointer, ULONG_PTR GuestInstructionPointer));
+; 
+; A wrapper for VmInitializationRoutine.
 AsmInitialieVM PROC
     pushfq
     PUSHAQ
@@ -69,7 +72,7 @@ AsmInitialieVM PROC
     mov rcx, rsp
 
     sub rsp, 28h
-    call rax                ; InitializationRoutine(rsp, asmResumeVM)
+    call rax                ; VmInitializationRoutine(rsp, asmResumeVM)
     add rsp, 28h
 
     POPAQ
@@ -77,6 +80,8 @@ AsmInitialieVM PROC
     xor rax, rax            ; return false
     ret
 
+    ; This is where the vitalized guest start to execute after successful 
+    ; vmlaunch. 
 asmResumeVM:
     POPAQ
     popfq
@@ -90,7 +95,10 @@ AsmInitialieVM ENDP
 .CODE
 
 
+; An entry point of VMM where gets called whenever VM-exit occurred.
 AsmVmmEntryPoint PROC
+    ; No need to save the flag registers since it is restored from the VMCS at
+    ; the time of vmresume.
     PUSHAQ                  ; -8 * 16
     mov rcx, rsp
     
@@ -105,9 +113,13 @@ AsmVmmEntryPoint PROC
     vmresume
     int 3
     jz errorWithCode        ; if (ZF) jmp
-    jmp errorWithoutCode
+    jmp errorWithoutCode 
 
+    ; Executes vmxoff and ends virtualization
 exitVM:
+    ;   r8  = Guest's rflags
+    ;   rdx = Guest's rsp
+    ;   rcx = Guest's rip for the next instruction
     POPAQ
     vmxoff
     jz errorWithCode        ; if (ZF) jmp
@@ -127,9 +139,10 @@ errorWithoutCode:
 AsmVmmEntryPoint ENDP
 
 
-
 ; EXTERN_C VMX_STATUS AsmVmxCall(_In_ ULONG_PTR HyperCallNumber,
 ;                                _In_opt_ void *Context);
+;
+; Executes vmcall with the given hypercall number and a context parameter.
 AsmVmxCall PROC
     vmcall                  ; vmcall(HyperCallNumber, Context)
     jz errorWithCode        ; if (ZF) jmp
@@ -288,6 +301,7 @@ AsmXsetbv PROC
 AsmXsetbv ENDP
 
 
+; Calls MiscWaitForever() which puts this thread sleep forever. 
 AsmWaitForever PROC
     pushfq
     PUSHAQ
@@ -296,13 +310,15 @@ AsmWaitForever PROC
     add rdx, 8*17
     
     sub rsp, 28h
-    call MiscWaitForever    ; Using jmp instead will cause inexplicable
-                            ; bug check in a subsequent sleep function.
+    call MiscWaitForever    ; Using jmp instead will cause bug check in a 
+                            ; subsequent sleep function.
     add rsp, 28h
     
     POPAQ
     popfq
+    int 3
     ret
 AsmWaitForever ENDP
+
 
 END

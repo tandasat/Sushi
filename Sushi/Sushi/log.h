@@ -87,15 +87,25 @@ static const auto LOG_OPT_DISABLE_PROCESSOR_NUMBER = 0x400ul;
 // prototypes
 //
 
+// Initialize the log system.
+// Returns STATUS_SUCCESS when it succeeded, or returns
+// STATUS_REINITIALIZATION_NEEDED when re-initialization with
+// LogRegisterReinitialization() is required.
 EXTERN_C NTSTATUS LogInitialization(_In_ ULONG Flag,
-                                    _In_opt_ const wchar_t *FilePath,
-                                    _In_ PDRIVER_OBJECT DriverObject,
-                                    _In_opt_ PDEVICE_OBJECT DeviceObject);
+                                    _In_opt_ const wchar_t *FilePath);
 
+// Register re-initialization. DriverEntry() must return STATUS_SUCCESS when
+// this function is called.
+EXTERN_C void LogRegisterReinitialization(_In_ PDRIVER_OBJECT DriverObject);
+
+// Terminates the log system quickly. It should be called from an
+// IRP_MJ_SHUTDOWN handler.
 EXTERN_C void LogIrpShutdownHandler();
 
+// Terminates the log system. It should be called from a DriverUnload routine.
 EXTERN_C void LogTermination();
 
+// (internal) Use LOG_*() macros instead.
 EXTERN_C NTSTATUS LogpPrint(_In_ ULONG Level, _In_ const char *FunctionName,
                             _In_ const char *Format, ...);
 

@@ -40,9 +40,9 @@ SushiTest.exe and see its output is being changed.
 ![Basic Output](/img/basic_output.png)
 
 Also, you can install ChangeMSR.sys in the same way as above to trigger more 
-interesting activities.
+interesting activities (although you may get bug check 0x109 if you are unlucky
+as this driver does not handle all possible patterns).
 ![Detected](/img/detected.png)
-
 
 
 Supported Platform(s)

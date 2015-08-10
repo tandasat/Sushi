@@ -2,6 +2,15 @@
 ; This module implements common macros
 ;
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+; constants
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+; macros
+;
 
 ; Saves all general purpose registers to the stack
 PUSHAQ MACRO
@@ -9,7 +18,7 @@ PUSHAQ MACRO
     push    rcx
     push    rdx
     push    rbx
-    push    -1     ; dummy for rsp
+    push    -1      ; dummy for rsp
     push    rbp
     push    rsi
     push    rdi
@@ -43,3 +52,10 @@ POPAQ MACRO
     pop     rcx
     pop     rax
 ENDM
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+; implementations
+;
+

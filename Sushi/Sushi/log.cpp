@@ -21,7 +21,7 @@
 // A size for log buffer in NonPagedPool. Two buffers are allocated with this
 // size. Exceeded logs are ignored silently. Make it bigger if a buffered log
 // size often reach this size.
-static const auto LOGP_BUFFER_SIZE_IN_PAGES = 10ul;
+static const auto LOGP_BUFFER_SIZE_IN_PAGES = 8ul;
 
 // An actual log buffer size in bytes.
 static const auto LOGP_BUFFER_SIZE = PAGE_SIZE * LOGP_BUFFER_SIZE_IN_PAGES;
@@ -55,8 +55,6 @@ struct LogBufferInfo {
   bool ResourceInitialized;
   volatile bool BufferFlushThreadShouldBeAlive;
   HANDLE BufferFlushThreadHandle;
-  PDRIVER_OBJECT DriverObject;
-  PDEVICE_OBJECT DeviceObject;
   wchar_t LogFilePath[MAX_PATH];
 };
 
@@ -69,8 +67,7 @@ EXTERN_C NTKERNELAPI UCHAR *NTAPI
 PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 EXTERN_C static NTSTATUS LogpInitializeBufferInfo(
-    _In_ const wchar_t *LogFilePath, _In_ PDRIVER_OBJECT DriverObject,
-    _In_opt_ PDEVICE_OBJECT DeviceObject, _Inout_ LogBufferInfo *Info);
+    _In_ const wchar_t *LogFilePath, _Inout_ LogBufferInfo *Info);
 
 EXTERN_C static NTSTATUS LogpInitializeLogFile(_Inout_ LogBufferInfo *Info);
 
@@ -130,36 +127,34 @@ static LogBufferInfo g_LogpLogBufferInfo = {};
 
 ALLOC_TEXT(INIT, LogInitialization)
 _Use_decl_annotations_ EXTERN_C NTSTATUS
-LogInitialization(ULONG Flag, const wchar_t *LogFilePath,
-                  PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT DeviceObject) {
+LogInitialization(ULONG Flag, const wchar_t *LogFilePath) {
   PAGED_CODE();
 
   auto status = STATUS_SUCCESS;
 
   g_LogpDebugFlag = Flag;
 
-  if (DeviceObject && !LogFilePath) {
-    return STATUS_INVALID_PARAMETER;
-  }
-
   // Initialize a log file if a log file path is specified.
+  bool needReinitialization = false;
   if (LogFilePath) {
-    status = LogpInitializeBufferInfo(LogFilePath, DriverObject, DeviceObject,
-                                      &g_LogpLogBufferInfo);
-    if (!NT_SUCCESS(status)) {
+    status = LogpInitializeBufferInfo(LogFilePath, &g_LogpLogBufferInfo);
+    if (status == STATUS_REINITIALIZATION_NEEDED) {
+      needReinitialization = true;
+    } else if (!NT_SUCCESS(status)) {
       return status;
     }
   }
 
   // Test the log.
-  status = LOG_INFO(
-      "Log has been initialized (Flag= %08x, Buffer= %p %p, File= %S).", Flag,
-      g_LogpLogBufferInfo.LogBuffer1, g_LogpLogBufferInfo.LogBuffer2,
-      LogFilePath);
+  status = LOG_INFO("Log has been %sinitialized (Buffer= %p %p, File= %S).",
+                    (needReinitialization ? "partially " : ""),
+                    g_LogpLogBufferInfo.LogBuffer1,
+                    g_LogpLogBufferInfo.LogBuffer2, LogFilePath);
   if (!NT_SUCCESS(status)) {
     goto Fail;
   }
-  return status;
+  return (needReinitialization ? STATUS_REINITIALIZATION_NEEDED
+                               : STATUS_SUCCESS);
 
 Fail:;
   if (LogFilePath) {
@@ -171,13 +166,10 @@ Fail:;
 // Initialize a log file related code such as a flushing thread.
 ALLOC_TEXT(INIT, LogpInitializeBufferInfo)
 _Use_decl_annotations_ EXTERN_C static NTSTATUS LogpInitializeBufferInfo(
-    const wchar_t *LogFilePath, PDRIVER_OBJECT DriverObject,
-    PDEVICE_OBJECT DeviceObject, LogBufferInfo *Info) {
+    const wchar_t *LogFilePath, LogBufferInfo *Info) {
   NT_ASSERT(LogFilePath);
   NT_ASSERT(Info);
 
-  Info->DriverObject = DriverObject;
-  Info->DeviceObject = DeviceObject;
   KeInitializeSpinLock(&Info->SpinLock);
 
   auto status = RtlStringCchCopyW(
@@ -192,15 +184,6 @@ _Use_decl_annotations_ EXTERN_C static NTSTATUS LogpInitializeBufferInfo(
     return status;
   }
   Info->ResourceInitialized = true;
-
-  if (Info->DeviceObject) {
-    // We can handle IRP_MJ_SHUTDOWN in order to flush buffered log entries.
-    status = IoRegisterShutdownNotification(Info->DeviceObject);
-    if (!NT_SUCCESS(status)) {
-      LogpFinalizeBufferInfo(Info);
-      return status;
-    }
-  }
 
   // Allocate two log buffers on NonPagedPool.
   Info->LogBuffer1 = reinterpret_cast<char *>(ExAllocatePoolWithTag(
@@ -233,10 +216,10 @@ _Use_decl_annotations_ EXTERN_C static NTSTATUS LogpInitializeBufferInfo(
 
   status = LogpInitializeLogFile(Info);
   if (status == STATUS_OBJECT_PATH_NOT_FOUND) {
-    IoRegisterBootDriverReinitialization(Info->DriverObject,
-                                         LogpReinitializationRoutine, Info);
-    LOG_INFO("The log file will be activated later.");
-    status = STATUS_SUCCESS;
+    LOG_DEBUG("The log file needs to be activated later.");
+    status = STATUS_REINITIALIZATION_NEEDED;
+  } else if (!NT_SUCCESS(status)) {
+    LogpFinalizeBufferInfo(Info);
   }
   return status;
 }
@@ -279,6 +262,14 @@ _Use_decl_annotations_ EXTERN_C static NTSTATUS LogpInitializeLogFile(
     Info->BufferFlushThreadShouldBeAlive = false;
   }
   return status;
+}
+
+ALLOC_TEXT(INIT, LogRegisterReinitialization)
+_Use_decl_annotations_ EXTERN_C void LogRegisterReinitialization(
+    PDRIVER_OBJECT DriverObject) {
+  IoRegisterBootDriverReinitialization(
+      DriverObject, LogpReinitializationRoutine, &g_LogpLogBufferInfo);
+  LOG_INFO("The log file will be activated later.");
 }
 
 ALLOC_TEXT(PAGED, LogpReinitializationRoutine)
@@ -361,9 +352,6 @@ _Use_decl_annotations_ EXTERN_C static void LogpFinalizeBufferInfo(
     Info->LogBuffer1 = nullptr;
   }
 
-  if (Info->DeviceObject) {
-    IoUnregisterShutdownNotification(Info->DeviceObject);
-  }
   if (Info->ResourceInitialized) {
     ExDeleteResourceLite(&Info->Resource);
     Info->ResourceInitialized = false;
@@ -712,9 +700,9 @@ _Use_decl_annotations_ EXTERN_C static VOID LogpBufferFlushThreadRoutine(
   auto status = STATUS_SUCCESS;
   auto info = reinterpret_cast<LogBufferInfo *>(StartContext);
   LOG_DEBUG("Log thread started.");
-  NT_ASSERT(LogpIsLogFileActivated(*info));
 
   while (info->BufferFlushThreadShouldBeAlive) {
+    NT_ASSERT(LogpIsLogFileActivated(*info));
     LogpSleep(LOGP_AUTO_FLUSH_INTERVAL_MSEC);
     if (info->LogBufferHead[0]) {
       NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);

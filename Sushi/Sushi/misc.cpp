@@ -44,20 +44,24 @@ EXTERN_C PVOID NTAPI RtlPcToFileHeader(_In_ PVOID PcValue,
 EXTERN_C static PER_PROCESSOR_DATA *MiscpVmCallUnload();
 
 DECLSPEC_NORETURN EXTERN_C void MiscWaitForever(_In_ const ALL_REGISTERS *Regs,
-                              _In_ ULONG_PTR Rsp);
+                                                _In_ ULONG_PTR Rsp);
 
 EXTERN_C void MiscDumpGpRegisters(_In_ const ALL_REGISTERS *Regs,
                                   _In_ ULONG_PTR Rsp);
 
-EXTERN_C static bool MiscpIsPgContext(_In_ ULONG_PTR Register);
+EXTERN_C static bool MiscpIsPgContext(_In_ ULONG_PTR Address);
 
 ////////////////////////////////////////////////////////////////////////////////
 //
 // variables
 //
 
+// An address of ExAcquireResourceSharedLite. Used to verify the if the address
+// is a PatchGuard context.
 static ULONG_PTR g_MiscpExAcquireResourceSharedLite = 0;
 
+// Ranges of modules which very frequently causes VM-exit. Used as a quick
+// filter to avoid calling RtlPcToFileHeader() too often.
 static ULONG_PTR g_MiscpNtosBase = 0;
 static ULONG_PTR g_MiscpNtosEnd = 0;
 static ULONG_PTR g_MiscpHalBase = 0;
@@ -68,12 +72,16 @@ static ULONG_PTR g_MiscpHalEnd = 0;
 // implementations
 //
 
+// Initialize misc functions
 ALLOC_TEXT(INIT, MiscInitializeRuntimeInfo)
 _Use_decl_annotations_ EXTERN_C NTSTATUS MiscInitializeRuntimeInfo() {
+  // Solve an address of ExAcquireResourceSharedLite. Note that it is not going
+  // to be a real address when DriverVerifier is active in the system.
   UNICODE_STRING procName = RTL_CONSTANT_STRING(L"ExAcquireResourceSharedLite");
   g_MiscpExAcquireResourceSharedLite =
       reinterpret_cast<ULONG_PTR>(MmGetSystemRoutineAddress(&procName));
 
+  // Get a list of system modules currently loaded
   auto status = AuxKlibInitialize();
   if (!NT_SUCCESS(status)) {
     return status;
@@ -99,6 +107,7 @@ _Use_decl_annotations_ EXTERN_C NTSTATUS MiscInitializeRuntimeInfo() {
     goto End;
   }
 
+  // Enumerate the list and get ranges of some modules
   status = STATUS_UNSUCCESSFUL;
   const auto numberOfModules = bufferSize / sizeof(AUX_MODULE_EXTENDED_INFO);
   for (auto i = 0; i < numberOfModules; ++i) {
@@ -127,6 +136,7 @@ End:;
   return status;
 }
 
+// Allocates continuous physical memory
 _Use_decl_annotations_ EXTERN_C void *MiscAllocateContiguousMemory(
     SIZE_T NumberOfBytes) {
   PHYSICAL_ADDRESS highestAcceptableAddress = {};
@@ -134,22 +144,26 @@ _Use_decl_annotations_ EXTERN_C void *MiscAllocateContiguousMemory(
   return MmAllocateContiguousMemory(NumberOfBytes, highestAcceptableAddress);
 }
 
+// Frees an address allocated by MiscAllocateContiguousMemory()
 _Use_decl_annotations_ EXTERN_C void MiscFreeContiguousMemory(
     void *BaseAddress) {
   MmFreeContiguousMemory(BaseAddress);
 }
 
+// Stops virtualization through a hypercall and frees all related memory
 _Use_decl_annotations_ EXTERN_C NTSTATUS MiscStopVM(void *Context) {
   UNREFERENCED_PARAMETER(Context);
 
   LOG_INFO("Terminating VMX for the processor %d",
-            KeGetCurrentProcessorNumber());
+           KeGetCurrentProcessorNumber());
+
+  // Stop virtualization and get an address of the management structure
   auto ProcessorData = MiscpVmCallUnload();
-  LOG_DEBUG("ProcessorData= %p", ProcessorData);
   if (!ProcessorData) {
     return STATUS_UNSUCCESSFUL;
   }
 
+  // Frees all related memory
   if (ProcessorData->MsrBitmap) {
     MiscFreeContiguousMemory(ProcessorData->MsrBitmap);
   }
@@ -169,17 +183,18 @@ _Use_decl_annotations_ EXTERN_C NTSTATUS MiscStopVM(void *Context) {
   return STATUS_SUCCESS;
 }
 
+// Stops virtualization through a hypercall and returns an address of the
+// management structure
 _Use_decl_annotations_ EXTERN_C static PER_PROCESSOR_DATA *MiscpVmCallUnload() {
   PER_PROCESSOR_DATA *context = nullptr;
-  LOG_DEBUG("context at %p", &context);
   auto status = MiscVmCall(SUSHI_BACKDOOR_CODE, &context);
-  LOG_DEBUG("context at %p %p", &context, context);
   if (!NT_SUCCESS(status)) {
     return nullptr;
   }
   return context;
 }
 
+// Executes VMCALL
 _Use_decl_annotations_ EXTERN_C NTSTATUS MiscVmCall(ULONG_PTR HyperCallNumber,
                                                     void *Context) {
   __try {
@@ -192,6 +207,9 @@ _Use_decl_annotations_ EXTERN_C NTSTATUS MiscVmCall(ULONG_PTR HyperCallNumber,
   }
 }
 
+// Checks if the Address is out of any kernel modules. Beware that this is not
+// comprehensive check to detect all possible patterns of the interesting things
+// 
 _Use_decl_annotations_ EXTERN_C bool MiscIsInterestingAddress(
     ULONG_PTR Address) {
   if (Address >= reinterpret_cast<ULONG_PTR>(MmSystemRangeStart) &&
@@ -208,20 +226,20 @@ _Use_decl_annotations_ EXTERN_C bool MiscIsInterestingAddress(
 // Wait forever in order to disable this PatchGuard context.
 // Note that this function should not be executed from the first validation
 // routine that runs as DPC. Since DPC routine cannot lower IRQL, execution of
-// this routine results in bug check. 
+// this routine results in bug check.
 _Use_decl_annotations_ EXTERN_C void MiscWaitForever(const ALL_REGISTERS *Regs,
                                                      ULONG_PTR Rsp) {
   UNREFERENCED_PARAMETER(Regs);
   UNREFERENCED_PARAMETER(Rsp);
-  
+
   LOG_INFO_SAFE(
       "I got tired of protecting your system and want to sleep. Bye.");
   DBG_BREAK();
 
 #pragma warning(push)
 #pragma warning(disable : 28138)
-  // The constant argument should instead be variable	The constant argument '0' 
-  // should instead be variable.
+  // The constant argument should instead be variable	The constant argument
+  // '0' should instead be variable.
   KeLowerIrql(PASSIVE_LEVEL);
 #pragma warning(push)
 
@@ -257,6 +275,7 @@ _Use_decl_annotations_ EXTERN_C void MiscDumpGpRegisters(
   }
 }
 
+// Checks if the context have a reference to the PatchGuard context.
 _Use_decl_annotations_ EXTERN_C bool MiscIsInterestingContext(
     const GP_REGISTERS *Regs) {
   if (MiscpIsPgContext(Regs->rax) || MiscpIsPgContext(Regs->rbx) ||
@@ -271,20 +290,21 @@ _Use_decl_annotations_ EXTERN_C bool MiscIsInterestingContext(
   return false;
 }
 
+// Checks if the Address is the PatchGuard context
 _Use_decl_annotations_ EXTERN_C static bool MiscpIsPgContext(
-    ULONG_PTR Register) {
+    ULONG_PTR Address) {
   const auto pExAcquireResourceSharedLite = g_MiscpExAcquireResourceSharedLite;
-  const auto pgContext = reinterpret_cast<PgContext *>(Register);
+  const auto pgContext = reinterpret_cast<PgContext *>(Address);
   if (UtilIsAccessibleAddress(&pgContext->ExAcquireResourceSharedLite_8) &&
       pgContext->ExAcquireResourceSharedLite_8 ==
           pExAcquireResourceSharedLite) {
-    LOG_INFO_SAFE("PatchGuard Context = %p", Register);
+    LOG_INFO_SAFE("PatchGuard Context = %p", Address);
     return true;
   }
   if (UtilIsAccessibleAddress(&pgContext->ExAcquireResourceSharedLite_10) &&
       pgContext->ExAcquireResourceSharedLite_10 ==
           pExAcquireResourceSharedLite) {
-    LOG_INFO_SAFE("PatchGuard Context = %p", Register);
+    LOG_INFO_SAFE("PatchGuard Context = %p", Address);
     return true;
   }
 

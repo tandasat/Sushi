@@ -6,13 +6,10 @@
 // This module implements an entry point of the driver.
 //
 #include "stdafx.h"
-#include "ia32_type.h"
-#include "vmx_type.h"
+#include "log.h"
 #include "vminit.h"
 #include "misc.h"
 #include "util.h"
-#include "log.h"
-#include "asm.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -72,18 +69,23 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
   DBG_BREAK();
 
-  status = LogInitialization(SUSHIP_LOG_LEVEL, SUSHIP_LOG_FILE_PATH,
-                             DriverObject, nullptr);
-  if (!NT_SUCCESS(status)) {
+  // Initialize log functions
+  bool needReinitialization = false;
+  status = LogInitialization(SUSHIP_LOG_LEVEL, SUSHIP_LOG_FILE_PATH);
+  if (status == STATUS_REINITIALIZATION_NEEDED) {
+    needReinitialization = true;
+  } else if (!NT_SUCCESS(status)) {
     return status;
   }
 
+  // Initialize misc functions
   status = MiscInitializeRuntimeInfo();
   if (!NT_SUCCESS(status)) {
     LogTermination();
     return status;
   }
 
+  // Virtualize all processors
   status = UtilForEachProcessor(VminitStartVM, nullptr);
   if (!NT_SUCCESS(status)) {
     UtilForEachProcessor(MiscStopVM, nullptr);
@@ -91,10 +93,16 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     return status;
   }
 
-  LOG_INFO("The VMM was installed.");
+  // Register re-initialization for the log functions if needed
+  if (needReinitialization) {
+    LogRegisterReinitialization(DriverObject);
+  }
+
+  LOG_INFO("The VMM has been installed.");
   return status;
 }
 
+// Unload handler
 ALLOC_TEXT(PAGED, SushipDriverUnload)
 _Use_decl_annotations_ EXTERN_C static void SushipDriverUnload(
     PDRIVER_OBJECT DriverObject) {
@@ -102,27 +110,36 @@ _Use_decl_annotations_ EXTERN_C static void SushipDriverUnload(
   PAGED_CODE();
 
   DBG_BREAK();
+
+  // Create a thread dedicated to de-virtualizing processors. For some reasons,
+  // de-virtualizing processors from this thread makes the system stop
+  // processing all timer related events and functioning properly.
   HANDLE threadHandle = nullptr;
   auto status =
       PsCreateSystemThread(&threadHandle, GENERIC_ALL, nullptr, nullptr,
                            nullptr, SushipVmxOffThreadRoutine, nullptr);
   if (NT_SUCCESS(status)) {
+    // Wait until the thread ends its work.
     status = ZwWaitForSingleObject(threadHandle, FALSE, nullptr);
     status = ZwClose(threadHandle);
   } else {
     DBG_BREAK();
   }
+
+  // Terminates the log functions
   LogTermination();
 }
 
+// De-virtualizing all processors
 ALLOC_TEXT(PAGED, SushipVmxOffThreadRoutine)
 _Use_decl_annotations_ EXTERN_C static VOID SushipVmxOffThreadRoutine(
     void* StartContext) {
   UNREFERENCED_PARAMETER(StartContext);
   PAGED_CODE();
+
   LOG_INFO("Uninstalling VMM.");
   auto status = UtilForEachProcessor(MiscStopVM, nullptr);
-  LOG_INFO("The VMM was uninstalled.");
+  LOG_INFO("The VMM has been uninstalled.");
 
   PsTerminateSystemThread(status);
 }

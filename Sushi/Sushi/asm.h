@@ -29,7 +29,7 @@
 // prototypes
 //
 
-EXTERN_C bool AsmInitialieVM(_In_ void(* VmInitializationRoutine)(
+EXTERN_C bool AsmInitialieVM(_In_ void (*VmInitializationRoutine)(
     ULONG_PTR GuestStackPointer, ULONG_PTR GuestInstructionPointer));
 
 EXTERN_C void AsmVmmEntryPoint();
@@ -102,6 +102,6 @@ EXTERN_C inline void __sgdt(_Out_ void *Gdtr) {
   AsmReadGDT(static_cast<GDTR *>(Gdtr));
 }
 
-EXTERN_C inline void __lgdt(_In_ const void *Gdtr) {
-  AsmWriteGDT(static_cast<const GDTR *>(Gdtr));
+EXTERN_C inline void __lgdt(_In_ void *Gdtr) {
+  AsmWriteGDT(static_cast<GDTR *>(Gdtr));
 }
