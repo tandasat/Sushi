@@ -1,9 +1,8 @@
 Sushi
 ======
 
-Sushi is a tiny, simple hypervisor written to demonstrate an ability to analyze
-kernel mode code from the Ring-1. As an example, it detects a certain pattern of
-PatchGuard activities and stops them when it is observed.
+Sushi is a tiny, simple hypervisor based monitoring tool detecting and stopping
+some of PatchGuard activities from Ring-1.
 
 
 Installation and Uninstallation
