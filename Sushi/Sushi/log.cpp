@@ -21,7 +21,7 @@
 // A size for log buffer in NonPagedPool. Two buffers are allocated with this
 // size. Exceeded logs are ignored silently. Make it bigger if a buffered log
 // size often reach this size.
-static const auto LOGP_BUFFER_SIZE_IN_PAGES = 8ul;
+static const auto LOGP_BUFFER_SIZE_IN_PAGES = 10ul;
 
 // An actual log buffer size in bytes.
 static const auto LOGP_BUFFER_SIZE = PAGE_SIZE * LOGP_BUFFER_SIZE_IN_PAGES;

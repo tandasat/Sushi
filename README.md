@@ -4,6 +4,9 @@ Sushi
 Sushi is a tiny, simple hypervisor based monitoring tool detecting and stopping
 some of PatchGuard activities from Ring-1.
 
+A related blog entry can be found here:
+    http://standa-note.blogspot.ca/2015/08/writing-hypervisor-for-kernel-mode-code.html
+
 
 Installation and Uninstallation
 --------------------------------

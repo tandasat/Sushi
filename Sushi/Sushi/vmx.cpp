@@ -246,11 +246,10 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleRdtsc(
   GuestContext->GpRegs->rax =
       tsc.LowPart & 0xffffff00;  // Drop lowest 8 bits for demo
 
-  // Return 0 when the guest is in an interesting address
+  // Log when the guest is in an interesting address
   if (MiscIsInterestingAddress(GuestContext->Rip)) {
     LOG_DEBUG_SAFE("GuestRip= %p, Rdtsc  => %p", GuestContext->Rip,
                    tsc.QuadPart);
-    tsc.QuadPart = 0;
   }
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
 }
@@ -390,15 +389,6 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleGdtrOrIdtrAccess(
     operationAddress &= 0xffffffff;
   }
 
-  // Log when the guest is in an interesting address
-  if (MiscIsInterestingAddress(GuestContext->Rip)) {
-    LOG_INFO_SAFE(
-        "GuestRip= %p, %s%sDT(%p)", GuestContext->Rip,
-        ((exitQualification.Fields.InstructionIdentity & 2) ? "L" : "S"),
-        ((exitQualification.Fields.InstructionIdentity & 1) ? "I" : "G"),
-        operationAddress);
-  }
-
   // Emulate the instruction
   auto descriptorTableReg = reinterpret_cast<IDTR *>(operationAddress);
   switch (exitQualification.Fields.InstructionIdentity) {
@@ -420,6 +410,16 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleGdtrOrIdtrAccess(
       VmxpVmWrite(GUEST_IDTR_BASE, descriptorTableReg->Address);
       VmxpVmWrite(GUEST_IDTR_LIMIT, descriptorTableReg->Limit);
       break;
+  }
+
+  // Log when the guest is in an interesting address
+  if (MiscIsInterestingAddress(GuestContext->Rip)) {
+    LOG_INFO_SAFE(
+        "GuestRip= %p, %s%sDT(Base=%p, Limit=%04X, at %p)", GuestContext->Rip,
+        ((exitQualification.Fields.InstructionIdentity & 2) ? "L" : "S"),
+        ((exitQualification.Fields.InstructionIdentity & 1) ? "I" : "G"),
+        descriptorTableReg->Address, descriptorTableReg->Limit,
+        operationAddress);
   }
 
   VmxpAdjustGuestInstructionPointer(GuestContext->Rip);
@@ -503,9 +503,10 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleDrAccess(
   // Log when the guest is in an interesting address
   if (MiscIsInterestingAddress(GuestContext->Rip)) {
     LOG_INFO_SAFE(
-        "GuestRip= %p, DR=%d, AC=%s, GP=%d (%p)", GuestContext->Rip,
+        "GuestRip= %p, DR=%d, %s, Register=%2d (%p)", GuestContext->Rip,
         exitQualification.Fields.DebuglRegister,
-        ((exitQualification.Fields.Direction == MOVE_TO_DR) ? "W" : "R"),
+        ((exitQualification.Fields.Direction == MOVE_TO_DR) ? "Write"
+                                                            : "Read "),
         exitQualification.Fields.Register, *registerUsed);
   }
 
@@ -579,6 +580,7 @@ _Use_decl_annotations_ EXTERN_C static void VmxpHandleCrAccess(
               // seems to be interesting as well.
               if (!cr0current.Fields.WP && cr0requested.Fields.WP &&
                   MiscIsInterestingContext(GuestContext->GpRegs)) {
+                DBG_BREAK();
                 wantToContinue = false;
               }
             }

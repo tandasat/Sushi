@@ -209,7 +209,7 @@ _Use_decl_annotations_ EXTERN_C NTSTATUS MiscVmCall(ULONG_PTR HyperCallNumber,
 
 // Checks if the Address is out of any kernel modules. Beware that this is not
 // comprehensive check to detect all possible patterns of the interesting things
-// 
+//
 _Use_decl_annotations_ EXTERN_C bool MiscIsInterestingAddress(
     ULONG_PTR Address) {
   if (Address >= reinterpret_cast<ULONG_PTR>(MmSystemRangeStart) &&
@@ -295,15 +295,12 @@ _Use_decl_annotations_ EXTERN_C static bool MiscpIsPgContext(
     ULONG_PTR Address) {
   const auto pExAcquireResourceSharedLite = g_MiscpExAcquireResourceSharedLite;
   const auto pgContext = reinterpret_cast<PgContext *>(Address);
-  if (UtilIsAccessibleAddress(&pgContext->ExAcquireResourceSharedLite_8) &&
-      pgContext->ExAcquireResourceSharedLite_8 ==
-          pExAcquireResourceSharedLite) {
-    LOG_INFO_SAFE("PatchGuard Context = %p", Address);
-    return true;
-  }
-  if (UtilIsAccessibleAddress(&pgContext->ExAcquireResourceSharedLite_10) &&
-      pgContext->ExAcquireResourceSharedLite_10 ==
-          pExAcquireResourceSharedLite) {
+  if ((UtilIsAccessibleAddress(&pgContext->ExAcquireResourceSharedLite_8) &&
+       pgContext->ExAcquireResourceSharedLite_8 ==
+           pExAcquireResourceSharedLite) ||
+      (UtilIsAccessibleAddress(&pgContext->ExAcquireResourceSharedLite_10) &&
+       pgContext->ExAcquireResourceSharedLite_10 ==
+           pExAcquireResourceSharedLite)) {
     LOG_INFO_SAFE("PatchGuard Context = %p", Address);
     return true;
   }
