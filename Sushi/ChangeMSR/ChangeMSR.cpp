@@ -81,7 +81,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
   status = LogInitialization(LOG_LEVEL, nullptr);
   if (!NT_SUCCESS(status)) {
-    ExFreePoolWithTag(g_Trampoline, POOL_TAG_NAME);
+    return status;
   }
 
   // Build the following code as a SYSENTER handler on NonPagedPool
